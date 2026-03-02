@@ -223,6 +223,14 @@ Security-first engineering principles:
 
 ---
 
+###  Support the Project
+
+If you find this tool useful, consider supporting its development:
+
+* **Bitcoin (BTC):** `bc1q7m5pkqy6fwlmpc0k6hcvkjs954k2jyxea3tcv0`
+
+---
+
 #  License
 
 MIT (replace if different).
