@@ -3,3 +3,12 @@
 *.rcpt
 *.tmp
 .vscode/
+.idea/
+.DS_Store
+
+# Local secrets / keys should never be committed.
+*.key
+*.pem
+*.kdbx
+.env
+.env.*

@@ -1,248 +1,252 @@
-
-#  rCrypt
+# rCrypt
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Build: Passing](https://img.shields.io/badge/build-passing-brightgreen)
 ![Language: Rust](https://img.shields.io/badge/Language-Rust-orange)
+![Unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success)
 
-`rcrypt` is a robust, high-performance, command-line file encryption tool written in Rust.
-Designed for security-critical environments, it provides authenticated encryption, memory-safe execution, parallel processing, and extreme hardening against forensic recovery.
+`rcrypt` is a hardened command-line file encryption tool written in Rust.
+It is designed for environments where confidentiality and integrity of
+data at rest must not be negotiable: authenticated encryption, memory-safe
+execution, parallel processing, and aggressive binary hardening.
 
----
-
-##  Cryptographic Architecture
-
-- **Encryption Algorithm**: AES-256-GCM (Authenticated Encryption with Associated Data)
-- **Key Derivation Function (KDF)**: Argon2id (v19) ensuring strong resistance against GPU/ASIC brute-force and side-channel attacks.
-- **Memory Protection**: Cryptographic materials (keys, passphrases, buffers) are wrapped in `Zeroizing` types, guaranteeing secure wipe from RAM immediately after use, mitigating Cold Boot Attacks and swap leaks.
-- **Large File Support**: Processes data in constant-memory chunks (default 1 MiB), preventing OOM crashes even for multi-terabyte files.
-- **Integrity Verification**: Strict validation of file structures, headers, and GCM authentication tags. Fails securely upon detecting tampering or truncation.
+> **Status:** v1.1.0 — security-audited release. See `SECURITY.md` for
+> the threat model and reporting procedure.
 
 ---
 
-##  Features
+## Cryptographic Architecture
 
--  **Multithreaded Execution**  
-  Encrypt or decrypt entire directories concurrently using `-t` worker threads.
+| Concern              | Choice                                                |
+| -------------------- | ----------------------------------------------------- |
+| Symmetric encryption | AES-256-GCM (NIST SP 800-38D)                         |
+| KDF                  | Argon2id v1.3 (RFC 9106)                              |
+| Default KDF cost     | t = 4, m = 256 MiB, p = 4                             |
+| Salt                 | 16 random bytes per file (`OsRng`)                    |
+| Nonce                | 8 random base bytes + 4 counter bytes per chunk       |
+| MAC                  | GCM 16-byte tag per chunk                             |
+| AAD                  | Full header bound as AAD into every chunk             |
+| Key zeroization      | `zeroize` on every buffer holding plaintext/keys      |
+| Unsafe code          | `#![forbid(unsafe_code)]` at crate root               |
+| Core dumps           | Disabled via `/proc/self/coredump_filter` on Linux    |
+| Panic policy         | `panic = "abort"` (no unwinder reads dropped frames)  |
+| Overflow checks      | Enforced in release builds                            |
 
--  **In-Place Encryption**  
-  Encrypt massive files directly on disk without requiring double free storage space (`-s`).
-
--  **Secure Wipe**  
-  Multi-pass overwrite of original files before unlinking (`-p`), destroying residual magnetic traces. See Security Considerations regarding SSDs.
-
--  **Keyfiles & Multi-Factor Support**  
-  Supports 1 MiB binary keyfiles (`-k`) that can be combined with a passphrase (`--with-pass`) for 2FA-like encryption.
-
--  **Pipeline Ready**  
-  Decrypt directly to `stdout` (`--cat`) for shell piping without writing plaintext to disk.
+Every encrypted file begins with a versioned header that records the KDF
+parameters actually used. Older files encrypted under weaker defaults
+still decrypt correctly because the header is the source of truth.
 
 ---
 
-##  Compilation & Hardening (Bunker Mode)
+## Features
 
-`rcrypt` is designed to be compiled statically with extreme system-level hardening:
+- **Authenticated, chunked AEAD.** AES-256-GCM with a per-chunk nonce
+  derived from `(random_base, counter)`, with the full header bound as
+  AAD so even a single flipped header bit causes decryption to fail.
+- **Strong KDF defaults.** Argon2id with 256 MiB / 4 iterations / 4 lanes
+  — resistant to GPU/ASIC brute force at substantial cost.
+- **Parallel batch processing.** `-t N` workers process files in
+  parallel; a single passphrase is derived once and shared across workers
+  inside `Zeroizing` containers.
+- **In-place encryption (`-s`).** Encrypts massive files directly in
+  place without doubling disk usage. Performs a full read-back
+  authentication pass before renaming so corrupted output never wins.
+- **Best-effort secure wipe (`-p N`).** Multi-pattern overwrite
+  (0x00 → 0xFF → random) of original files before unlinking. Effective
+  on rotating media; flash media require full-disk encryption (see
+  warning below).
+- **Symlink protection.** Refuses to read or write through symlinks by
+  default. A malicious link cannot redirect rcrypt to victim files.
+- **Keyfiles & 2FA-style mode.** 1 MiB binary keyfile (`-k`) can be used
+  alone or combined with a passphrase (`--with-pass`) for two-factor
+  decryption.
+- **Pipeline mode (`--cat`).** Decrypts to stdout without ever writing
+  plaintext to disk. Compatible with shell pipelines.
+- **Process hardening.** On Linux, core dumps are disabled at startup so
+  a crash cannot spill recently-touched key material to disk.
 
-- Stack Canaries
-- Full RELRO
-- PIE (Position Independent Executable)
-- Path remapping to prevent host information leaks
+---
 
-###  Linux
+## Installation
 
 ```bash
-chmod +x build_Linux.sh
-./build_Linux.sh
+git clone https://github.com/Sh4ngTsung/rustCrypt.git
+cd rustCrypt
+./build_Linux.sh        # Linux/macOS (bash)
+build_Windows.cmd       # Windows (Developer Command Prompt)
 ```
 
-Binary location:
+The hardened binary is written to `./target/release/rcrypt`.
 
-```
-./target/release/rcrypt
-```
+### Linux hardening flags
 
-Enforced flags:
+The `build_Linux.sh` script enforces:
 
-- `-fstack-protector-strong`
-- Full RELRO
+- Full RELRO + BIND_NOW (`-Wl,-z,relro,-z,now`)
+- Non-executable stack (`-Wl,-z,noexecstack`)
+- Strict library binding (`-Wl,-z,defs`)
+- PIE (Position-Independent Executable)
+- Stack canaries (`-fstack-protector-strong`)
+- CET shadow stacks (`-fcf-protection=full`)
+- Path remapping so the binary contains no host paths
+- Sanity check: build aborts if a host path leaks into the binary or if
+  the ELF is not a PIE / has an executable stack
 
-###  Windows
+### Windows hardening flags
 
-Run via Developer Command Prompt:
-
-```cmd
-build_Windows.cmd
-```
-
-Enforced flags:
-
-- `/CETCOMPAT`
-- `/NXCOMPAT`
-- `/DYNAMICBASE`
+`build_Windows.cmd` enforces `/CETCOMPAT`, `/NXCOMPAT`, `/DYNAMICBASE`,
+`/HIGHENTROPYVA`, `/GUARD:CF`, and strips debug data.
 
 ---
 
-#  Usage Guide
+## Usage
 
-## 🔹 Basic Operations
-
-### Encrypt a single file
+### Basic operations
 
 ```bash
-rcrypt -e -f secret.pdf
-```
+# Encrypt a single file
+rcrypt -e -f secret.pdf            # writes secret.pdf.rcpt, removes the original
 
-Output: `secret.pdf.rcpt`  
-Original file is removed.
-
-### Decrypt a single file
-
-```bash
+# Decrypt a single file
 rcrypt -d -f secret.pdf.rcpt
+
+# Encrypt a directory in parallel (8 workers)
+rcrypt -e -r /path/to/confidential -t 8
+
+# Decrypt straight to stdout without touching disk
+rcrypt -d --cat -f credentials.txt.rcpt | grep '^admin'
 ```
 
-### Encrypt a directory recursively (8 threads)
+### Keyfiles
 
 ```bash
-rcrypt -e -r /path/to/confidential/ -t 8
+# Generate a fresh 1 MiB key (file is created with 0600 perms)
+rcrypt -g master.key
+
+# Encrypt using the keyfile only
+rcrypt -e -k master.key -f data.tar.gz
+
+# Encrypt using keyfile + passphrase (2FA style)
+rcrypt -e -k usb/master.key --with-pass -f secret.txt
 ```
 
----
-
-## 🔹 Advanced Operations
-
-### In-Place Encryption
+### In-place encryption
 
 ```bash
 rcrypt -e -s -f massive_database.sql
 ```
 
-⚠️ If interrupted, the file may become permanently corrupted.
+> **Warning:** in-place mode rewrites the file as it goes. A power loss
+> mid-operation may permanently corrupt the file. Always keep a backup.
+> rcrypt performs a full read-back authentication pass before promoting
+> the result, but cannot help if the storage layer fails first.
 
-### Secure Wipe (3 passes)
+### Secure wipe (HDD only)
 
 ```bash
 rcrypt -e -f keys.txt -p 3
 ```
 
-### Decrypt directly to stdout
-
-```bash
-rcrypt -d -c -f credentials.txt.rcpt | grep "admin"
-```
-
-### Generate and Use a Binary Keyfile
-
-Generate:
-
-```bash
-rcrypt -g master.key
-```
-
-Encrypt:
-
-```bash
-rcrypt -e -k master.key -f data.tar.gz
-```
-
-Decrypt:
-
-```bash
-rcrypt -d -k master.key -f data.tar.gz.rcpt
-```
-
-### Combine Keyfile + Passphrase
-
-```bash
-rcrypt -e -k usb_drive/master.key --with-pass -f secret.txt
-```
+> Wipes on flash storage (SSD, NVMe, eMMC, SD cards, USB sticks) are
+> **not** reliable because of wear-leveling and the FTL. Use full-disk
+> encryption on solid-state media.
 
 ---
 
-##  Environment Variables
+## Environment variables
 
-`rcrypt` can read passphrases from:
+`rcrypt` will read a passphrase from any of the following variables:
 
-- `RCrypt_PASS`
+- `RCRYPT_PASS`  (preferred)
+- `RCrypt_PASS`  (legacy alias)
 - `CRYPTSEC_PASS`
 
-Example:
-
 ```bash
-RCrypt_PASS="super_secret_password" rcrypt -e -f backup.zip
+RCRYPT_PASS="correct horse battery staple" rcrypt -e -f backup.zip
 ```
 
----
+To **refuse** environment passphrases (recommended on shared hosts where
+`/proc/<pid>/environ` is readable), pass `--no-env-pass`:
 
-# ⚠️ Security Considerations
+```bash
+rcrypt --no-env-pass -e -f backup.zip
+```
 
-## SSDs and NVMe
-
-The secure wipe feature (`-p` / `--passes`) is effective on magnetic HDDs.  
-Due to Wear Leveling and Flash Translation Layer (FTL) behavior, overwrite cannot be guaranteed on SSD/NVMe drives at the OS level.
-
-Recommendation: Use Full Disk Encryption (FDE) for SSD-backed systems.
-
-## In-Place Encryption (`-s`)
-
-- Destructive operation
-- Power loss may permanently corrupt files
-- Always maintain backups
+A passphrase from the environment must be at least 8 bytes; otherwise
+rcrypt aborts rather than encrypt with a degenerate secret.
 
 ---
 
-#  CLI Reference
+## CLI Reference
 
-| Flag | Description |
-|---|---|
-| `-e`, `--encrypt` | Encrypt files |
-| `-d`, `--decrypt` | Decrypt files |
-| `-r`, `--directory` | Directory to process recursively |
-| `-f`, `--single-file` | Single file to process |
-| `-t`, `--threads` | Number of worker threads (default: 3) |
-| `-c`, `--cat` | Print decrypted plaintext to stdout |
-| `-p`, `--passes` | Overwrite passes when wiping files (0 = no overwrite) |
-| `-s`, `--inplace` | In-place encryption (modifies file directly) |
-| `-k`, `--key-file` | Use a binary key file instead of a passphrase |
-| `--with-pass` | Combine key file with typed passphrase |
-| `-g`, `--gen-key` | Generate a new random 1 MiB key file |
-| `-v`, `--verbose` | Enable verbose output |
-| `--include-system` | Include system noise files (`desktop.ini`, `Thumbs.db`) |
-
----
-
-#  Design Philosophy
-
-Security-first engineering principles:
-
-- Fail securely
-- Minimize attack surface
-- Zero sensitive memory
-- Harden binaries aggressively
-- Avoid unnecessary dependencies
+| Flag                 | Description                                                              |
+| -------------------- | ------------------------------------------------------------------------ |
+| `-e`, `--encrypt`    | Encrypt files                                                            |
+| `-d`, `--decrypt`    | Decrypt files                                                            |
+| `-r`, `--directory`  | Directory to process recursively                                         |
+| `-f`, `--single-file`| Single file (or directory) to process                                    |
+| `-t`, `--threads`    | Worker threads (default 3, max 256)                                      |
+| `-c`, `--cat`        | Decrypt to stdout (requires exactly one `.rcpt` input)                   |
+| `-p`, `--passes`     | Overwrite passes on the original file (0 = no overwrite, HDD only)       |
+| `-s`, `--inplace`    | In-place encryption (no double space, fail-secure)                       |
+| `-k`, `--key-file`   | Use a binary keyfile instead of (or with) a passphrase                   |
+| `--with-pass`        | Combine keyfile with a typed passphrase                                  |
+| `-g`, `--gen-key`    | Generate a fresh 1 MiB keyfile (mode 0600)                               |
+| `--no-env-pass`      | Refuse to read passphrases from `RCRYPT_PASS` / `CRYPTSEC_PASS`          |
+| `--include-system`   | Process OS noise files (`desktop.ini`, `Thumbs.db`, `.DS_Store`, etc.)   |
+| `-v`, `--verbose`    | Verbose progress output                                                  |
+| `-h`, `--help`       | Show full help                                                           |
+| `-V`, `--version`    | Show version                                                             |
 
 ---
 
-###  Support the Project
+## Threat model
+
+`rcrypt` protects data **at rest** against an attacker who has the
+ciphertext but does not have the passphrase / keyfile. It explicitly
+does **not** protect against:
+
+- A compromised host that can read process memory or scrape keys before
+  zeroization completes.
+- A user who reuses a low-entropy passphrase across files (Argon2id only
+  buys a constant slowdown).
+- Wear-leveled flash media: physical erase is not possible at the file
+  level. Use FDE.
+- Backups, swap files, or filesystem snapshots that captured plaintext
+  prior to encryption.
+
+See `SECURITY.md` for the full threat model and the security reporting
+procedure.
+
+---
+
+## Continuous integration
+
+Every push and pull request runs:
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --release` on Linux, macOS, and Windows
+- `cargo audit` for known CVEs in dependencies
+- `cargo deny check` for licence + dependency policy (`deny.toml`)
+
+---
+
+## Support the project
 
 If you find this tool useful, consider supporting its development:
 
-* **Bitcoin (BTC):** `bc1q7m5pkqy6fwlmpc0k6hcvkjs954k2jyxea3tcv0`
+- **Bitcoin (BTC):** `bc1q7m5pkqy6fwlmpc0k6hcvkjs954k2jyxea3tcv0`
 
 ---
 
-#  License
+## License
 
-MIT (replace if different).
-
----
-
-#  Contributing
-
-Pull requests, audits, and responsible vulnerability disclosures are welcome.
+MIT — see `LICENSE` (or this repository's licence file).
 
 ---
 
-#  rcrypt
+## Contributing
 
-Fast. Hardened. Memory-safe. Built for environments where encryption must not fail.
+Pull requests, security audits, and responsible vulnerability
+disclosures are welcome. Please read `SECURITY.md` before reporting
+anything sensitive.

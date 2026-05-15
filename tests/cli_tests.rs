@@ -1,6 +1,6 @@
 use assert_cmd::prelude::*;
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use predicates::prelude::*;
 use std::fs;
 use std::io::Write;
@@ -27,7 +27,7 @@ fn encrypt_decrypt_roundtrip_single_file() {
     let src_path = src.path().to_path_buf();
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-e")
         .arg("-f")
         .arg(&src_path)
@@ -43,7 +43,7 @@ fn encrypt_decrypt_roundtrip_single_file() {
     assert!(enc_path.exists());
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-d")
         .arg("-f")
         .arg(&enc_path)
@@ -67,9 +67,8 @@ fn encrypt_decrypt_roundtrip_single_file_inplace() {
     src.write_str("payload-inplace-ok").unwrap();
     let src_path = src.path().to_path_buf();
 
-    // encrypt in-place (-s)
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-e")
         .arg("-s")
         .arg("-f")
@@ -86,7 +85,7 @@ fn encrypt_decrypt_roundtrip_single_file_inplace() {
     assert!(enc_path.exists());
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-d")
         .arg("-f")
         .arg(&enc_path)
@@ -112,7 +111,10 @@ fn decrypt_cat_prints_exact_bytes() {
     let src_path = src.path().to_path_buf();
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW).arg("-e").arg("-f").arg(&src_path);
+    cmd.env("RCRYPT_PASS", PW)
+        .arg("-e")
+        .arg("-f")
+        .arg(&src_path);
     cmd.assert().success();
 
     let enc_path = PathBuf::from(format!("{}.rcpt", src_path.to_string_lossy()));
@@ -120,12 +122,14 @@ fn decrypt_cat_prints_exact_bytes() {
     assert!(!src_path.exists());
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-d")
         .arg("--cat")
         .arg("-f")
         .arg(&enc_path);
-    cmd.assert().success().stdout(predicate::eq(data.as_slice()));
+    cmd.assert()
+        .success()
+        .stdout(predicate::eq(data.as_slice()));
 }
 
 #[test]
@@ -135,10 +139,44 @@ fn invalid_magic_is_rejected() {
     bogus.write_str("NOT-RCrypt-Header").unwrap();
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW).arg("-d").arg("-f").arg(bogus.path());
+    cmd.env("RCRYPT_PASS", PW)
+        .arg("-d")
+        .arg("-f")
+        .arg(bogus.path());
     cmd.assert()
         .success()
         .stderr(predicate::str::contains("invalid magic"));
+}
+
+#[test]
+fn wrong_password_is_rejected() {
+    let td = TempDir::new().unwrap();
+    let src = td.child("secret.txt");
+    src.write_str("top-secret-payload").unwrap();
+    let src_path = src.path().to_path_buf();
+
+    let mut cmd = bin_cmd();
+    cmd.env("RCRYPT_PASS", PW)
+        .arg("-e")
+        .arg("-f")
+        .arg(&src_path);
+    cmd.assert().success();
+
+    let enc_path = PathBuf::from(format!("{}.rcpt", src_path.to_string_lossy()));
+    assert!(enc_path.exists());
+
+    let mut cmd = bin_cmd();
+    cmd.env("RCRYPT_PASS", "WRONG-PASSWORD")
+        .arg("-d")
+        .arg("-f")
+        .arg(&enc_path);
+    cmd.assert().success().stderr(
+        predicate::str::contains("failed to decrypt")
+            .or(predicate::str::contains("authentication")),
+    );
+
+    let plain_path = enc_path.with_extension("");
+    assert!(!plain_path.exists() || fs::read(&plain_path).unwrap_or_default().is_empty());
 }
 
 #[test]
@@ -149,7 +187,10 @@ fn destination_exists_error_on_decrypt() {
     let src_path = src.path().to_path_buf();
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW).arg("-e").arg("-f").arg(&src_path);
+    cmd.env("RCRYPT_PASS", PW)
+        .arg("-e")
+        .arg("-f")
+        .arg(&src_path);
     cmd.assert().success();
 
     let enc_path = PathBuf::from(format!("{}.rcpt", src_path.to_string_lossy()));
@@ -158,7 +199,10 @@ fn destination_exists_error_on_decrypt() {
     write_file(&src_path, b"some-content");
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW).arg("-d").arg("-f").arg(&enc_path);
+    cmd.env("RCRYPT_PASS", PW)
+        .arg("-d")
+        .arg("-f")
+        .arg(&enc_path);
     cmd.assert()
         .success()
         .stderr(predicate::str::contains("destination already exists"));
@@ -173,7 +217,7 @@ fn truncation_is_detected_or_fails() {
     let src_path = src.path().to_path_buf();
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-e")
         .arg("-f")
         .arg(&src_path)
@@ -196,7 +240,10 @@ fn truncation_is_detected_or_fails() {
     }
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW).arg("-d").arg("-f").arg(&enc_path);
+    cmd.env("RCRYPT_PASS", PW)
+        .arg("-d")
+        .arg("-f")
+        .arg(&enc_path);
     cmd.assert().success().stderr(
         predicate::str::contains("failed to decrypt chunk")
             .or(predicate::str::contains("decrypted length mismatch"))
@@ -204,6 +251,37 @@ fn truncation_is_detected_or_fails() {
             .or(predicate::str::contains("read"))
             .or(predicate::str::contains("truncated/corrupted")),
     );
+}
+
+#[test]
+fn tampered_ciphertext_is_rejected() {
+    let td = TempDir::new().unwrap();
+    let src = td.child("tamper.txt");
+    src.write_str("authenticated-data-must-not-be-modified")
+        .unwrap();
+    let src_path = src.path().to_path_buf();
+
+    let mut cmd = bin_cmd();
+    cmd.env("RCRYPT_PASS", PW)
+        .arg("-e")
+        .arg("-f")
+        .arg(&src_path);
+    cmd.assert().success();
+
+    let enc_path = PathBuf::from(format!("{}.rcpt", src_path.to_string_lossy()));
+    let mut bytes = fs::read(&enc_path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    fs::write(&enc_path, &bytes).unwrap();
+
+    let mut cmd = bin_cmd();
+    cmd.env("RCRYPT_PASS", PW)
+        .arg("-d")
+        .arg("-f")
+        .arg(&enc_path);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("failed to decrypt"));
 }
 
 #[test]
@@ -216,7 +294,7 @@ fn directory_parallel_encrypt_decrypt() {
     }
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-e")
         .arg("-r")
         .arg(td.path())
@@ -233,7 +311,7 @@ fn directory_parallel_encrypt_decrypt() {
     }
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-d")
         .arg("-r")
         .arg(td.path())
@@ -310,7 +388,7 @@ fn key_file_plus_passphrase_roundtrip() {
     let src_path = src.path().to_path_buf();
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-e")
         .arg("-k")
         .arg(&key_path)
@@ -324,7 +402,7 @@ fn key_file_plus_passphrase_roundtrip() {
     assert!(!src_path.exists());
 
     let mut cmd = bin_cmd();
-    cmd.env("RCrypt_PASS", PW)
+    cmd.env("RCRYPT_PASS", PW)
         .arg("-d")
         .arg("-k")
         .arg(&key_path)
@@ -337,4 +415,82 @@ fn key_file_plus_passphrase_roundtrip() {
     assert!(!enc_path.exists());
     let got = fs::read(&src_path).unwrap();
     assert_eq!(got, b"key+pass combo payload");
+}
+
+#[test]
+fn refuses_to_encrypt_symlink() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let td = TempDir::new().unwrap();
+        let target = td.child("target.txt");
+        target.write_str("target-content").unwrap();
+        let link = td.path().join("link.txt");
+        symlink(target.path(), &link).unwrap();
+
+        let mut cmd = bin_cmd();
+        cmd.env("RCRYPT_PASS", PW).arg("-e").arg("-f").arg(&link);
+        cmd.assert()
+            .success()
+            .stderr(predicate::str::contains("symlink"));
+
+        assert!(target.path().exists());
+    }
+}
+
+#[test]
+fn key_file_size_validated() {
+    let td = TempDir::new().unwrap();
+    let key = td.child("short.key");
+    key.write_str("too-short").unwrap();
+
+    let src = td.child("data.txt");
+    src.write_str("payload").unwrap();
+
+    let mut cmd = bin_cmd();
+    cmd.arg("-e")
+        .arg("-k")
+        .arg(key.path())
+        .arg("-f")
+        .arg(src.path());
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("key file must be exactly"));
+}
+
+#[test]
+fn validate_args_short_passphrase_rejected() {
+    let td = TempDir::new().unwrap();
+    let src = td.child("data.txt");
+    src.write_str("payload").unwrap();
+
+    let mut cmd = bin_cmd();
+    cmd.env("RCRYPT_PASS", "short")
+        .arg("-e")
+        .arg("-f")
+        .arg(src.path());
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("too short").or(predicate::str::contains("passphrase")));
+}
+
+#[test]
+fn no_env_pass_blocks_environment_secret() {
+    let td = TempDir::new().unwrap();
+    let src = td.child("data.txt");
+    src.write_str("payload").unwrap();
+
+    let mut cmd = bin_cmd();
+    cmd.env("RCRYPT_PASS", PW)
+        .arg("--no-env-pass")
+        .arg("-e")
+        .arg("-f")
+        .arg(src.path())
+        .arg("-t")
+        .arg("1");
+    // With env reading disabled and no TTY available the prompt will EOF.
+    cmd.assert().failure();
+    assert!(src.path().exists());
+    let enc = PathBuf::from(format!("{}.rcpt", src.path().to_string_lossy()));
+    assert!(!enc.exists());
 }

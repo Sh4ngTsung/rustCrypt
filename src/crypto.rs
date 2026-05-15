@@ -1,6 +1,6 @@
 use crate::constants::*;
 use crate::utils::read_exact_at;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
 use std::fs::File;
 use zeroize::Zeroizing;
@@ -16,10 +16,29 @@ pub struct Header {
 
 pub fn clamp_kdf(p: KdfParams) -> KdfParams {
     KdfParams {
-        time: p.time.clamp(1, 10),
-        memory_kib: p.memory_kib.clamp(8 * 1024, 1 << 20),
-        parallel: p.parallel.clamp(1, 8),
+        time: p.time.clamp(KDF_TIME_MIN, KDF_TIME_MAX),
+        memory_kib: p.memory_kib.clamp(KDF_MEMORY_KIB_MIN, KDF_MEMORY_KIB_MAX),
+        parallel: p.parallel.clamp(KDF_PARALLEL_MIN, KDF_PARALLEL_MAX),
     }
+}
+
+pub fn validate_kdf(p: KdfParams) -> Result<()> {
+    if !(KDF_TIME_MIN..=KDF_TIME_MAX).contains(&p.time) {
+        bail!("KDF time parameter out of allowed range: {}", p.time);
+    }
+    if !(KDF_MEMORY_KIB_MIN..=KDF_MEMORY_KIB_MAX).contains(&p.memory_kib) {
+        bail!(
+            "KDF memory parameter out of allowed range: {} KiB",
+            p.memory_kib
+        );
+    }
+    if !(KDF_PARALLEL_MIN..=KDF_PARALLEL_MAX).contains(&p.parallel) {
+        bail!(
+            "KDF parallelism parameter out of allowed range: {}",
+            p.parallel
+        );
+    }
+    Ok(())
 }
 
 pub fn build_header_bytes_v2(
@@ -82,14 +101,21 @@ pub fn read_and_parse_header(src: &mut File) -> Result<(Vec<u8>, Header)> {
         None
     };
 
+    let kdf = KdfParams {
+        time,
+        memory_kib,
+        parallel,
+    };
+    validate_kdf(kdf).context("rejected KDF parameters from header")?;
+
+    if !(MIN_CHUNK_SZ..=MAX_CHUNK_SZ).contains(&chunk_size) {
+        bail!("unsupported chunk size in header: {}", chunk_size);
+    }
+
     Ok((
         hdr,
         Header {
-            kdf: KdfParams {
-                time,
-                memory_kib,
-                parallel,
-            },
+            kdf,
             chunk_size,
             salt,
             base_nonce,
@@ -113,16 +139,20 @@ pub fn derive_key_argon2id(
     Ok(out)
 }
 
-pub fn make_chunk_nonce(
-    base_nonce: &[u8; BASE_NONCE_SIZE],
-    counter: u32,
-) -> [u8; GCM_NONCE_SIZE] {
+pub fn make_chunk_nonce(base_nonce: &[u8; BASE_NONCE_SIZE], counter: u32) -> [u8; GCM_NONCE_SIZE] {
     let mut nonce = [0u8; GCM_NONCE_SIZE];
     nonce[..BASE_NONCE_SIZE].copy_from_slice(base_nonce);
     nonce[BASE_NONCE_SIZE..].copy_from_slice(&counter.to_le_bytes());
     nonce
 }
 
+/// Combine a raw key file and a passphrase into a single secret that is
+/// then fed to Argon2id. The encoding is `key || 0x00 || passphrase`.
+///
+/// Note: this format is preserved verbatim across releases so that files
+/// encrypted with `--with-pass` under any previous rcrypt build continue
+/// to decrypt correctly. Bumping this scheme would require a header flag
+/// and an explicit version migration.
 pub fn combine_key_and_pass(key: &[u8], passphrase: &[u8]) -> Zeroizing<Vec<u8>> {
     let mut combined = Zeroizing::new(Vec::with_capacity(key.len() + 1 + passphrase.len()));
     combined.extend_from_slice(key);
@@ -131,3 +161,78 @@ pub fn combine_key_and_pass(key: &[u8], passphrase: &[u8]) -> Zeroizing<Vec<u8>>
     combined
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_kdf_brings_extremes_into_range() {
+        let too_small = KdfParams {
+            time: 0,
+            memory_kib: 1,
+            parallel: 0,
+        };
+        let c = clamp_kdf(too_small);
+        assert!((KDF_TIME_MIN..=KDF_TIME_MAX).contains(&c.time));
+        assert!((KDF_MEMORY_KIB_MIN..=KDF_MEMORY_KIB_MAX).contains(&c.memory_kib));
+        assert!((KDF_PARALLEL_MIN..=KDF_PARALLEL_MAX).contains(&c.parallel));
+
+        let too_big = KdfParams {
+            time: u32::MAX,
+            memory_kib: u32::MAX,
+            parallel: u8::MAX,
+        };
+        let c = clamp_kdf(too_big);
+        assert!((KDF_TIME_MIN..=KDF_TIME_MAX).contains(&c.time));
+        assert!((KDF_MEMORY_KIB_MIN..=KDF_MEMORY_KIB_MAX).contains(&c.memory_kib));
+        assert!((KDF_PARALLEL_MIN..=KDF_PARALLEL_MAX).contains(&c.parallel));
+    }
+
+    #[test]
+    fn validate_kdf_rejects_invalid_params() {
+        let bad = KdfParams {
+            time: 0,
+            memory_kib: DEFAULT_KDF.memory_kib,
+            parallel: DEFAULT_KDF.parallel,
+        };
+        assert!(validate_kdf(bad).is_err());
+        assert!(validate_kdf(DEFAULT_KDF).is_ok());
+    }
+
+    #[test]
+    fn make_chunk_nonce_is_deterministic_and_unique_per_counter() {
+        let base = [0xAAu8; BASE_NONCE_SIZE];
+        let n0 = make_chunk_nonce(&base, 0);
+        let n1 = make_chunk_nonce(&base, 1);
+        assert_eq!(&n0[..BASE_NONCE_SIZE], &base);
+        assert_ne!(n0, n1);
+        // Counter bytes are appended at the tail in little-endian.
+        assert_eq!(&n1[BASE_NONCE_SIZE..], &1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn combine_key_and_pass_is_separator_bound() {
+        let a = combine_key_and_pass(b"abc", b"def");
+        let b = combine_key_and_pass(b"ab", b"cdef");
+        // Both produce 7 bytes but with the NUL separator they differ.
+        assert_ne!(&**a, &**b);
+        assert_eq!(&**a, b"abc\0def");
+        assert_eq!(&**b, b"ab\0cdef");
+    }
+
+    #[test]
+    fn build_header_has_expected_layout() {
+        let kdf = DEFAULT_KDF;
+        let salt = [1u8; SALT_SIZE];
+        let nonce = [2u8; BASE_NONCE_SIZE];
+        let h = build_header_bytes_v2(DEFAULT_CHUNK_SZ, &salt, &nonce, kdf, 42);
+        assert_eq!(h.len(), HEADER_LEN_V2);
+        assert_eq!(&h[0..8], MAGIC);
+        assert_eq!(h[8], FILE_VERSION_CURR);
+        assert_eq!(h[9], KDF_ARGON2ID);
+        assert_eq!(&h[23..39], &salt);
+        assert_eq!(&h[39..47], &nonce);
+        let pt_len = u64::from_le_bytes(h[47..55].try_into().unwrap());
+        assert_eq!(pt_len, 42);
+    }
+}

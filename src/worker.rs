@@ -23,7 +23,12 @@ pub fn collect_from_glob_pattern(pattern: &Path, include_system: bool) -> Vec<Pa
         .into_iter()
         .filter_map(Result::ok)
     {
-        if !entry.file_type().is_file() {
+        // Refuse to descend into or capture symlinks. WalkDir already
+        // ignores symlinked directories with follow_links(false); we add
+        // a defensive check for symlinked files so attacker-placed links
+        // never make it into the worker queue.
+        let ft = entry.file_type();
+        if !ft.is_file() || ft.is_symlink() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
@@ -63,16 +68,21 @@ pub fn start_workers(
     });
 
     if passes > 0 {
-        eprintln!("[WARNING] Secure wipe (-p) requested. Note that hardware wear-leveling on modern SSDs/NVMe drives may prevent the physical erasure of plaintext data. Use with caution on solid-state media.");
+        eprintln!(
+            "[WARNING] Secure wipe (-p) requested. Hardware wear-leveling on modern SSDs/NVMe \
+             drives may prevent the physical erasure of plaintext data. Use with caution on \
+             solid-state media."
+        );
     }
 
     let mut joins = Vec::new();
     for _ in 0..threads.max(1) {
         let rx = rx.clone();
         let err_tx = err_tx.clone();
-        let pass = passphrase.clone(); 
-        
+        let pass = passphrase.clone();
+
         let j = thread::spawn(move || {
+            let pass = pass; // shadow into the closure
             for path in rx.iter() {
                 let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
@@ -100,6 +110,10 @@ pub fn start_workers(
                     eprintln!("Processed {}", path.display());
                 }
             }
+            // `pass` is dropped here; Zeroizing wipes the clone before
+            // the thread exits, so no copy of the passphrase outlives
+            // the worker.
+            drop(pass);
         });
         joins.push(j);
     }

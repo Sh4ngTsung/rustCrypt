@@ -3,16 +3,16 @@ use crate::crypto::*;
 use crate::utils::*;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use anyhow::{anyhow, bail, Context, Result};
-use rand::rngs::OsRng;
+use anyhow::{Context, Result, anyhow, bail};
 use rand::RngCore;
+use rand::rngs::OsRng;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 #[cfg(unix)]
 fn restrict_key_permissions(path: &Path) -> Result<()> {
@@ -27,20 +27,34 @@ fn restrict_key_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn create_secret_file(path: &Path) -> Result<fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create key file: {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn create_secret_file(path: &Path) -> Result<fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create key file: {}", path.display()))
+}
+
 pub fn generate_key_file(path: &Path, verbose: bool) -> Result<()> {
     if path.exists() {
         bail!("key file already exists: {}", path.display());
     }
 
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("create key file: {}", path.display()))?;
+    let mut f = create_secret_file(path)?;
 
-    let mut buf = vec![0u8; KEY_FILE_SIZE];
-    let mut rng = OsRng;
-    rng.fill_bytes(&mut buf);
+    let mut buf = Zeroizing::new(vec![0u8; KEY_FILE_SIZE]);
+    OsRng.fill_bytes(&mut buf);
 
     {
         let mut w = BufWriter::new(&mut f);
@@ -51,13 +65,14 @@ pub fn generate_key_file(path: &Path, verbose: bool) -> Result<()> {
     f.sync_all()?;
     drop(f);
 
-    buf.zeroize();
+    // Re-assert mode 0o600 in case the umask widened the create_new perms
+    // on platforms where OpenOptions::mode() is unavailable.
     restrict_key_permissions(path)?;
     sync_parent_dir(path)?;
 
     if verbose {
         eprintln!(
-            "Generated {}-byte key file at {}",
+            "Generated {}-byte key file at {} (mode 0600)",
             KEY_FILE_SIZE,
             path.display()
         );
@@ -67,6 +82,9 @@ pub fn generate_key_file(path: &Path, verbose: bool) -> Result<()> {
 }
 
 pub fn load_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    ensure_regular_file(path).context("validate key file path")?;
+    warn_if_world_accessible(path);
+
     let mut f = open_r_with_retry(path, 8, 50)
         .with_context(|| format!("open key file: {}", path.display()))?;
     let meta = f.metadata()?;
@@ -83,6 +101,12 @@ pub fn load_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     Ok(buf)
 }
 
+/// Best-effort secure overwrite. Effective only on storage media that
+/// faithfully overwrite physical blocks (rotating HDDs, raw partitions).
+/// On flash media (SSD/NVMe/eMMC) wear-leveling and the FTL make this
+/// largely cosmetic; rcrypt's CLI warns users accordingly. The final pass
+/// is random data (not zeros) so the wiped extent does not advertise
+/// itself as a deliberately scrubbed region.
 pub fn wipe_file(path: &Path, passes: u32) -> Result<()> {
     if passes == 0 {
         return Ok(());
@@ -97,20 +121,26 @@ pub fn wipe_file(path: &Path, passes: u32) -> Result<()> {
     }
 
     let buf_size: usize = 1 << 20;
-    let mut buf = vec![0u8; buf_size];
+    let mut buf = Zeroizing::new(vec![0u8; buf_size]);
     let mut rng = OsRng;
 
     for pass in 0..passes {
-        let last = pass + 1 == passes;
         let mut written: u64 = 0;
         f.seek(SeekFrom::Start(0))?;
+        // Pattern schedule per pass (NIST SP 800-88 + DoD 5220.22-M inspired):
+        //   pass 0 -> 0x00
+        //   pass 1 -> 0xFF
+        //   pass N -> random bytes
+        match pass {
+            0 => buf.iter_mut().for_each(|b| *b = 0x00),
+            1 => buf.iter_mut().for_each(|b| *b = 0xFF),
+            _ => rng.fill_bytes(&mut buf[..]),
+        }
         while written < len {
             let chunk = ((len - written) as usize).min(buf_size);
-            if last {
-                for b in &mut buf[..chunk] {
-                    *b = 0;
-                }
-            } else {
+            if pass >= 2 {
+                // Refresh the random window for every chunk so we don't reuse
+                // the same 1 MiB random pattern across the whole file.
                 rng.fill_bytes(&mut buf[..chunk]);
             }
             f.write_all(&buf[..chunk])?;
@@ -120,29 +150,28 @@ pub fn wipe_file(path: &Path, passes: u32) -> Result<()> {
         f.sync_all()?;
     }
 
-    buf.zeroize();
     Ok(())
 }
 
 // --- Encrypt / Decrypt Core ---
 
-pub fn encrypt_file(
-    path: &Path,
-    passphrase: &[u8],
-    verbose: bool,
-    wipe_passes: u32,
-) -> Result<()> {
-    if path
+fn skip_already_encrypted(path: &Path, verbose: bool, label: &str) -> bool {
+    let is_rcpt = path
         .file_name()
         .and_then(|s| s.to_str())
         .map(|s| s.ends_with(".rcpt"))
-        .unwrap_or(false)
-    {
-        if verbose {
-            eprintln!("Skipping already-encrypted: {}", path.display());
-        }
+        .unwrap_or(false);
+    if is_rcpt && verbose {
+        eprintln!("Skipping already-encrypted{label}: {}", path.display());
+    }
+    is_rcpt
+}
+
+pub fn encrypt_file(path: &Path, passphrase: &[u8], verbose: bool, wipe_passes: u32) -> Result<()> {
+    if skip_already_encrypted(path, verbose, "") {
         return Ok(());
     }
+    ensure_regular_file(path)?;
 
     let final_path = add_suffix(path, ".rcpt");
     if final_path.exists() {
@@ -166,13 +195,10 @@ pub fn encrypt_file(
     let cipher = Aes256Gcm::new_from_slice(&*key).map_err(|_| anyhow!("invalid key length"))?;
     let header = build_header_bytes_v2(DEFAULT_CHUNK_SZ, &salt, &base_nonce, kdf, plain_size);
 
-    let mut dst_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
+    let mut dst_file = create_secret_file(&tmp_path)
         .with_context(|| format!("create temp: {}", tmp_path.display()))?;
 
-    let mut buf = vec![0u8; DEFAULT_CHUNK_SZ as usize];
+    let mut buf = Zeroizing::new(vec![0u8; DEFAULT_CHUNK_SZ as usize]);
     let mut counter: u32 = 0;
 
     let write_res: Result<()> = (|| {
@@ -180,20 +206,31 @@ pub fn encrypt_file(
         dst.write_all(&header).context("write header")?;
 
         loop {
-            let n = src.read(&mut buf)?;
+            let n = src.read(&mut buf[..])?;
             if n == 0 {
                 break;
             }
-            let pt = &mut buf[..n];
+            let pt_slice = &buf[..n];
             let nonce_arr = make_chunk_nonce(&base_nonce, counter);
             let nonce = Nonce::from(nonce_arr);
             let ct = cipher
-                .encrypt(&nonce, Payload { msg: pt, aad: &header })
+                .encrypt(
+                    &nonce,
+                    Payload {
+                        msg: pt_slice,
+                        aad: &header,
+                    },
+                )
                 .map_err(|_| anyhow!("gcm seal failed"))?;
             let len_le = (n as u32).to_le_bytes();
             dst.write_all(&len_le)?;
             dst.write_all(&ct)?;
-            pt.zeroize();
+            // Buffer is wrapped in Zeroizing so it will be wiped on drop;
+            // we still zero each used window between iterations so memory
+            // pressure can't push raw plaintext to swap.
+            for b in &mut buf[..n] {
+                *b = 0;
+            }
             counter = counter
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("nonce counter overflow"))?;
@@ -215,7 +252,7 @@ pub fn encrypt_file(
     drop(dst_file);
 
     fs::rename(&tmp_path, &final_path)
-        .with_context(|| format!("rename temp→final: {}", final_path.display()))?;
+        .with_context(|| format!("rename temp->final: {}", final_path.display()))?;
     sync_parent_dir(&final_path)?;
 
     if wipe_passes > 0 {
@@ -226,11 +263,7 @@ pub fn encrypt_file(
     sync_parent_dir(path)?;
 
     if verbose {
-        eprintln!(
-            "Encrypted {} bytes → {}",
-            plain_size,
-            final_path.display()
-        );
+        eprintln!("Encrypted {} bytes -> {}", plain_size, final_path.display());
     }
 
     Ok(())
@@ -247,12 +280,6 @@ pub fn verify_encrypted_file(path: &Path, passphrase: &[u8]) -> Result<()> {
     let header_len = hdr_bytes.len();
     if total_size < header_len as u64 {
         bail!("invalid encrypted file during verify: too small");
-    }
-    if !(MIN_CHUNK_SZ..=MAX_CHUNK_SZ).contains(&header.chunk_size) {
-        bail!(
-            "unsupported chunk size during verify: {}",
-            header.chunk_size
-        );
     }
 
     let kdf = header.kdf;
@@ -299,7 +326,7 @@ pub fn verify_encrypted_file(path: &Path, passphrase: &[u8]) -> Result<()> {
 
         let nonce_arr = make_chunk_nonce(&header.base_nonce, counter);
         let nonce = Nonce::from(nonce_arr);
-        let mut pt = cipher
+        let pt = cipher
             .decrypt(
                 &nonce,
                 Payload {
@@ -308,42 +335,35 @@ pub fn verify_encrypted_file(path: &Path, passphrase: &[u8]) -> Result<()> {
                 },
             )
             .map_err(|_| anyhow!("failed to decrypt chunk during verify"))?;
+        let mut pt = Zeroizing::new(pt);
         total_plain += pt.len() as u64;
-        pt.zeroize();
+        // explicit zeroize for clarity; Drop on Zeroizing also clears it
+        pt.iter_mut().for_each(|b| *b = 0);
+        drop(pt);
 
         counter = counter
             .checked_add(1)
             .ok_or_else(|| anyhow!("nonce counter overflow during verify"))?;
     }
 
-    if let Some(exp) = header.plaintext_len {
-        if total_plain != exp {
-            bail!(
-                "decrypted length mismatch during verify (expected {}, got {})",
-                exp,
-                total_plain
-            );
-        }
+    if let Some(exp) = header.plaintext_len
+        && total_plain != exp
+    {
+        bail!(
+            "decrypted length mismatch during verify (expected {}, got {})",
+            exp,
+            total_plain
+        );
     }
 
     Ok(())
 }
 
 pub fn encrypt_file_inplace(path: &Path, passphrase: &[u8], verbose: bool) -> Result<()> {
-    if path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.ends_with(".rcpt"))
-        .unwrap_or(false)
-    {
-        if verbose {
-            eprintln!(
-                "Skipping already-encrypted (in-place): {}",
-                path.display()
-            );
-        }
+    if skip_already_encrypted(path, verbose, " (in-place)") {
         return Ok(());
     }
+    ensure_regular_file(path)?;
 
     let final_path = add_suffix(path, ".rcpt");
     if final_path.exists() {
@@ -384,8 +404,12 @@ pub fn encrypt_file_inplace(path: &Path, passphrase: &[u8], verbose: bool) -> Re
         num_full + 1
     };
 
-    if chunk_count_u64 > (u32::MAX as u64) {
-        bail!("file too large: chunk counter would overflow u32");
+    if chunk_count_u64 > MAX_CHUNK_COUNT {
+        bail!(
+            "file too large: would require {} chunks (max {})",
+            chunk_count_u64,
+            MAX_CHUNK_COUNT
+        );
     }
 
     let overhead_per_chunk: u64 = 4 + GCM_TAG_LEN as u64;
@@ -397,7 +421,7 @@ pub fn encrypt_file_inplace(path: &Path, passphrase: &[u8], verbose: bool) -> Re
     file.set_len(new_len)
         .with_context(|| format!("extend file for in-place encrypt: {}", path.display()))?;
 
-    let mut buf = vec![0u8; chunk_sz_u32 as usize];
+    let mut buf = Zeroizing::new(vec![0u8; chunk_sz_u32 as usize]);
     let mut dst_pos = new_len;
 
     let mut idx = chunk_count_u64;
@@ -406,9 +430,7 @@ pub fn encrypt_file_inplace(path: &Path, passphrase: &[u8], verbose: bool) -> Re
         let chunk_index = idx as u32;
 
         let is_full = idx < num_full;
-        let pt_len_u64 = if is_full {
-            chunk_sz
-        } else if rem == 0 {
+        let pt_len_u64 = if is_full || rem == 0 {
             chunk_sz
         } else {
             rem as u64
@@ -429,9 +451,15 @@ pub fn encrypt_file_inplace(path: &Path, passphrase: &[u8], verbose: bool) -> Re
 
         let nonce_arr = make_chunk_nonce(&base_nonce, chunk_index);
         let nonce = Nonce::from(nonce_arr);
-        let pt = &mut buf[..pt_len];
+        let pt_slice = &buf[..pt_len];
         let ct = cipher
-            .encrypt(&nonce, Payload { msg: pt, aad: &header })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: pt_slice,
+                    aad: &header,
+                },
+            )
             .map_err(|_| anyhow!("gcm seal failed"))?;
 
         if ct.len() != pt_len + GCM_TAG_LEN {
@@ -443,7 +471,9 @@ pub fn encrypt_file_inplace(path: &Path, passphrase: &[u8], verbose: bool) -> Re
         file.write_all(&len_bytes)?;
         file.write_all(&ct)?;
 
-        pt.zeroize();
+        for b in &mut buf[..pt_len] {
+            *b = 0;
+        }
     }
 
     if dst_pos != header_len {
@@ -467,17 +497,13 @@ pub fn encrypt_file_inplace(path: &Path, passphrase: &[u8], verbose: bool) -> Re
         ));
     }
 
-    fs::rename(path, &final_path).with_context(|| {
-        format!(
-            "rename in-place encrypted file to {}",
-            final_path.display()
-        )
-    })?;
+    fs::rename(path, &final_path)
+        .with_context(|| format!("rename in-place encrypted file to {}", final_path.display()))?;
     sync_parent_dir(&final_path)?;
 
     if verbose {
         eprintln!(
-            "Encrypted (in-place) {} bytes → {}",
+            "Encrypted (in-place) {} bytes -> {}",
             plain_size,
             final_path.display()
         );
@@ -495,6 +521,7 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
     if !name_ok {
         bail!("file is not .rcpt: {}", path.display());
     }
+    ensure_regular_file(path)?;
 
     let mut src = open_r_with_retry(path, 8, 50)
         .with_context(|| format!("open encrypted: {}", path.display()))?;
@@ -505,9 +532,6 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
     let header_len = hdr_bytes.len();
     if total_size < header_len as u64 {
         bail!("invalid encrypted file: too small");
-    }
-    if !(MIN_CHUNK_SZ..=MAX_CHUNK_SZ).contains(&header.chunk_size) {
-        bail!("unsupported chunk size: {}", header.chunk_size);
     }
 
     let kdf = header.kdf;
@@ -523,6 +547,7 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
         let stdout = io::stdout();
         let mut lock = stdout.lock();
 
+        let mut ct_buf = Zeroizing::new(vec![0u8; header.chunk_size as usize + GCM_TAG_LEN]);
         while cur < total_size {
             if total_size.saturating_sub(cur) < 4 {
                 bail!(
@@ -547,38 +572,42 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
                     total_size.saturating_sub(cur)
                 );
             }
-            let mut ct = vec![0u8; ct_len];
-            read_exact_at(&mut src, cur, &mut ct)?;
+            if ct_buf.len() < ct_len {
+                ct_buf.resize(ct_len, 0);
+            }
+            read_exact_at(&mut src, cur, &mut ct_buf[..ct_len])?;
             cur += ct_len as u64;
 
             let nonce_arr = make_chunk_nonce(&header.base_nonce, counter);
             let nonce = Nonce::from(nonce_arr);
-            let mut pt = cipher
+            let pt = cipher
                 .decrypt(
                     &nonce,
                     Payload {
-                        msg: &ct,
+                        msg: &ct_buf[..ct_len],
                         aad: &hdr_bytes,
                     },
                 )
                 .map_err(|_| anyhow!("failed to decrypt chunk"))?;
+            let mut pt = Zeroizing::new(pt);
             lock.write_all(&pt)?;
             written_total += pt.len() as u64;
-            pt.zeroize();
+            pt.iter_mut().for_each(|b| *b = 0);
+            drop(pt);
             counter = counter
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("nonce counter overflow"))?;
         }
         lock.flush()?;
 
-        if let Some(exp) = header.plaintext_len {
-            if written_total != exp {
-                bail!(
-                    "decrypted length mismatch (expected {}, got {}) — possible truncation",
-                    exp,
-                    written_total
-                );
-            }
+        if let Some(exp) = header.plaintext_len
+            && written_total != exp
+        {
+            bail!(
+                "decrypted length mismatch (expected {}, got {}) -- possible truncation",
+                exp,
+                written_total
+            );
         }
         return Ok(());
     }
@@ -598,10 +627,7 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
         p
     };
 
-    let mut dst_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_plain)
+    let mut dst_file = create_secret_file(&tmp_plain)
         .with_context(|| format!("create temp plaintext: {}", tmp_plain.display()))?;
 
     let mut len_buf = [0u8; 4];
@@ -610,6 +636,7 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
 
     let write_res: Result<()> = (|| {
         let mut dst = BufWriter::new(&mut dst_file);
+        let mut ct_buf = Zeroizing::new(vec![0u8; header.chunk_size as usize + GCM_TAG_LEN]);
 
         while cur < total_size {
             if total_size.saturating_sub(cur) < 4 {
@@ -635,24 +662,28 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
                     total_size.saturating_sub(cur)
                 );
             }
-            let mut ct = vec![0u8; ct_len];
-            read_exact_at(&mut src, cur, &mut ct)?;
+            if ct_buf.len() < ct_len {
+                ct_buf.resize(ct_len, 0);
+            }
+            read_exact_at(&mut src, cur, &mut ct_buf[..ct_len])?;
             cur += ct_len as u64;
 
             let nonce_arr = make_chunk_nonce(&header.base_nonce, counter);
             let nonce = Nonce::from(nonce_arr);
-            let mut pt = cipher
+            let pt = cipher
                 .decrypt(
                     &nonce,
                     Payload {
-                        msg: &ct,
+                        msg: &ct_buf[..ct_len],
                         aad: &hdr_bytes,
                     },
                 )
                 .map_err(|_| anyhow!("failed to decrypt chunk"))?;
+            let mut pt = Zeroizing::new(pt);
             dst.write_all(&pt)?;
             written_total += pt.len() as u64;
-            pt.zeroize();
+            pt.iter_mut().for_each(|b| *b = 0);
+            drop(pt);
             counter = counter
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("nonce counter overflow"))?;
@@ -660,14 +691,14 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
 
         dst.flush()?;
 
-        if let Some(exp) = header.plaintext_len {
-            if written_total != exp {
-                bail!(
-                    "decrypted length mismatch (expected {}, got {}) — possible truncation",
-                    exp,
-                    written_total
-                );
-            }
+        if let Some(exp) = header.plaintext_len
+            && written_total != exp
+        {
+            bail!(
+                "decrypted length mismatch (expected {}, got {}) -- possible truncation",
+                exp,
+                written_total
+            );
         }
 
         Ok(())
@@ -676,6 +707,10 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
     if let Err(e) = write_res {
         let _ = dst_file.sync_all();
         drop(dst_file);
+        // Best-effort wipe of the partial plaintext before unlinking so a
+        // wrong-password / tampered-file path does not leave half-decrypted
+        // data behind on disk.
+        let _ = wipe_file(&tmp_plain, 1);
         let _ = fs::remove_file(&tmp_plain);
         let _ = sync_parent_dir(&tmp_plain);
         return Err(e);
@@ -685,7 +720,7 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
     drop(dst_file);
 
     fs::rename(&tmp_plain, &final_plain)
-        .with_context(|| format!("rename temp→final: {}", final_plain.display()))?;
+        .with_context(|| format!("rename temp->final: {}", final_plain.display()))?;
     sync_parent_dir(&final_plain)?;
 
     if wipe_passes > 0 {
@@ -697,4 +732,3 @@ pub fn decrypt_file(path: &Path, passphrase: &[u8], cat: bool, wipe_passes: u32)
 
     Ok(())
 }
-

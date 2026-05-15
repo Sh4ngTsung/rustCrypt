@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
+#![deny(rust_2018_idioms)]
 
 mod cli;
 mod constants;
 mod crypto;
+mod hardening;
 mod ops;
 mod utils;
 mod worker;
@@ -14,7 +16,7 @@ use crate::ops::{
 };
 use crate::utils::{ct_eq, is_system_noise};
 use crate::worker::{collect_from_glob_pattern, path_has_glob, start_workers};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Parser;
 use rpassword::read_password;
 use std::env;
@@ -22,9 +24,36 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
-fn get_passphrase_for_encryption() -> Result<Zeroizing<Vec<u8>>> {
-    if let Ok(p) = env::var("RCrypt_PASS").or_else(|_| env::var("CRYPTSEC_PASS")) {
-        return Ok(Zeroizing::new(p.into_bytes()));
+const PASSPHRASE_MIN_LEN: usize = 8;
+const MAX_THREADS: usize = 256;
+
+fn read_passphrase_from_env(allow_env: bool) -> Option<Zeroizing<Vec<u8>>> {
+    if !allow_env {
+        return None;
+    }
+    // NOTE: We deliberately do NOT call `env::remove_var`. In Rust 2024
+    // that API requires unsafe (POSIX getenv/setenv are not thread-safe);
+    // since the crate enforces `#![forbid(unsafe_code)]`, we leave the
+    // env entry in place. Callers that must hide secrets from child
+    // processes should `unset` the variable in their shell wrapper.
+    for key in ["RCRYPT_PASS", "RCrypt_PASS", "CRYPTSEC_PASS"] {
+        if let Ok(val) = env::var(key) {
+            return Some(Zeroizing::new(val.into_bytes()));
+        }
+    }
+    None
+}
+
+fn get_passphrase_for_encryption(allow_env: bool) -> Result<Zeroizing<Vec<u8>>> {
+    if let Some(p) = read_passphrase_from_env(allow_env) {
+        if p.len() < PASSPHRASE_MIN_LEN {
+            bail!(
+                "passphrase from environment is too short ({} bytes; need >= {})",
+                p.len(),
+                PASSPHRASE_MIN_LEN
+            );
+        }
+        return Ok(p);
     }
 
     eprint!("Enter encryption key: ");
@@ -39,12 +68,19 @@ fn get_passphrase_for_encryption() -> Result<Zeroizing<Vec<u8>>> {
     if !ct_eq(p1, p2) {
         bail!("keys do not match");
     }
+    if p1.len() < PASSPHRASE_MIN_LEN {
+        bail!(
+            "passphrase too short ({} bytes; need >= {})",
+            p1.len(),
+            PASSPHRASE_MIN_LEN
+        );
+    }
     Ok(Zeroizing::new(p1.to_vec()))
 }
 
-fn get_passphrase_for_decryption() -> Result<Zeroizing<Vec<u8>>> {
-    if let Ok(p) = env::var("RCrypt_PASS").or_else(|_| env::var("CRYPTSEC_PASS")) {
-        return Ok(Zeroizing::new(p.into_bytes()));
+fn get_passphrase_for_decryption(allow_env: bool) -> Result<Zeroizing<Vec<u8>>> {
+    if let Some(p) = read_passphrase_from_env(allow_env) {
+        return Ok(p);
     }
 
     eprint!("Enter decryption key: ");
@@ -53,10 +89,8 @@ fn get_passphrase_for_decryption() -> Result<Zeroizing<Vec<u8>>> {
     Ok(Zeroizing::new(pw.as_bytes().to_vec()))
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-
-    if let Some(ref key_out) = args.gen_key {
+fn validate_args(args: &Args) -> Result<()> {
+    if args.gen_key.is_some() {
         if args.encrypt
             || args.decrypt
             || args.cat
@@ -66,58 +100,77 @@ fn main() -> Result<()> {
             || args.inplace
             || args.with_pass
         {
-            eprintln!("-g/--gen-key cannot be combined with -e/-d/--cat/-s/--with-pass or input paths.");
-            std::process::exit(1);
+            bail!("-g/--gen-key cannot be combined with -e/-d/--cat/-s/--with-pass or input paths");
         }
+        return Ok(());
+    }
+    if args.encrypt && args.decrypt {
+        bail!("cannot use -e and -d together");
+    }
+    if !args.encrypt && !args.decrypt {
+        bail!("no operation specified (use -e/-d, see -h for help)");
+    }
+    if args.cat && !args.decrypt {
+        bail!("--cat is only valid with -d/--decrypt");
+    }
+    if args.cat && args.passes > 0 {
+        bail!("--cat does not consume the source file; -p/--passes is incompatible");
+    }
+    if args.inplace && !args.encrypt {
+        bail!("-s/--inplace is only valid with -e/--encrypt");
+    }
+    if args.inplace && args.passes > 0 {
+        bail!("-s/--inplace cannot be combined with -p/--passes (no extra copy to wipe)");
+    }
+    if args.with_pass && args.key_file.is_none() {
+        bail!("--with-pass requires -k/--key-file");
+    }
+    if args.threads == 0 || args.threads > MAX_THREADS {
+        bail!(
+            "invalid -t/--threads value: {} (must be 1..={})",
+            args.threads,
+            MAX_THREADS
+        );
+    }
+    Ok(())
+}
 
+fn main() -> Result<()> {
+    // Best-effort process hardening: disables core dumps and tightens
+    // ptrace exposure where the kernel allows. Done before we read any
+    // secret material so a crash during arg parsing also stays minimal.
+    let _ = hardening::apply_all();
+
+    let args = Args::parse();
+    if let Err(e) = validate_args(&args) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
+
+    if let Some(ref key_out) = args.gen_key {
         generate_key_file(key_out, args.verbose)?;
         return Ok(());
     }
 
-    if args.encrypt && args.decrypt {
-        eprintln!("Cannot use -e and -d together.");
-        std::process::exit(1);
-    }
-    if !args.encrypt && !args.decrypt {
-        eprintln!("No operation specified. Use -h for help.");
-        std::process::exit(1);
-    }
-    if args.cat && !args.decrypt {
-        eprintln!("--cat is only valid with -d/--decrypt.");
-        std::process::exit(1);
-    }
-
-    if args.inplace && !args.encrypt {
-        eprintln!("-s/--inplace is only valid with -e/--encrypt.");
-        std::process::exit(1);
-    }
-    if args.inplace && args.passes > 0 {
-        eprintln!("-s/--inplace cannot be combined with -p/--passes (no extra copy to wipe).");
-        std::process::exit(1);
-    }
-
-    if args.with_pass && args.key_file.is_none() {
-        eprintln!("--with-pass requires -k/--key-file.");
-        std::process::exit(1);
-    }
+    let allow_env = !args.no_env_pass;
 
     let mut secret: Zeroizing<Vec<u8>> = if let Some(ref key_path) = args.key_file {
         let key_bytes = load_key_file(key_path)?;
         if args.with_pass {
             if args.encrypt {
-                let pass = get_passphrase_for_encryption()?;
+                let pass = get_passphrase_for_encryption(allow_env)?;
                 combine_key_and_pass(&key_bytes, &pass)
             } else {
-                let pass = get_passphrase_for_decryption()?;
+                let pass = get_passphrase_for_decryption(allow_env)?;
                 combine_key_and_pass(&key_bytes, &pass)
             }
         } else {
             key_bytes
         }
     } else if args.encrypt {
-        get_passphrase_for_encryption()?
+        get_passphrase_for_encryption(allow_env)?
     } else {
-        get_passphrase_for_decryption()?
+        get_passphrase_for_decryption(allow_env)?
     };
 
     let mut files: Vec<PathBuf> = Vec::new();
@@ -147,11 +200,14 @@ fn main() -> Result<()> {
                         files.extend(collect_from_glob_pattern(&pat, args.include_system));
                     }
                     Ok(_) => files.push(PathBuf::from(p)),
-                    Err(_) => eprintln!("Skipping {}", p),
+                    Err(_) => eprintln!("Skipping {p}"),
                 }
             }
         }
     }
+
+    files.sort();
+    files.dedup();
 
     if files.is_empty() {
         eprintln!("No input files. Use -r/-f or paths/globs. See -h for help.");
@@ -167,7 +223,11 @@ fn main() -> Result<()> {
     if threads <= 1 {
         let pass = secret.clone();
         if args.passes > 0 {
-            eprintln!("[WARNING] Secure wipe (-p) requested. Note that hardware wear-leveling on modern SSDs/NVMe drives may prevent the physical erasure of plaintext data.");
+            eprintln!(
+                "[WARNING] Secure wipe (-p) requested. Hardware wear-leveling on modern SSDs/NVMe \
+                 drives may prevent the physical erasure of plaintext data. Use full-disk \
+                 encryption for solid-state media."
+            );
         }
         for path in files {
             let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");

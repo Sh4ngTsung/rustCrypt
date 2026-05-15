@@ -1,50 +1,44 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo [*] Setting build environment for Windows...
+echo [rcrypt-build] Setting hardened build environment for Windows...
 
-rem Absolute path to the project root
+rem Absolute path to the project root.
 set "ROOT=%CD%"
-
-rem Default Cargo home (where registry sources live)
 set "CARGO_HOME=%USERPROFILE%\.cargo"
 
-rem Hardened build flags and path remapping
-set "RUSTFLAGS=-C debuginfo=0 -C strip=symbols -C link-arg=/DEBUG:NONE -C link-arg=/CETCOMPAT -C link-arg=/NXCOMPAT -C link-arg=/DYNAMICBASE -C link-arg=/HIGHENTROPYVA --remap-path-prefix=%ROOT%=. --remap-path-prefix=%CARGO_HOME%=./cargo_home"
+rem MSVC hardening flags:
+rem   /CETCOMPAT       Hardware-enforced shadow stacks (Control-flow Enforcement).
+rem   /NXCOMPAT        Data Execution Prevention.
+rem   /DYNAMICBASE     Address Space Layout Randomization.
+rem   /HIGHENTROPYVA   64-bit ASLR with high-entropy.
+rem   /GUARD:CF        Control Flow Guard (where supported).
+rem   /DEBUG:NONE      Strip PDB / debug data from the binary.
+set "RUSTFLAGS=-C debuginfo=0 -C strip=symbols -C overflow-checks=on -C link-arg=/DEBUG:NONE -C link-arg=/CETCOMPAT -C link-arg=/NXCOMPAT -C link-arg=/DYNAMICBASE -C link-arg=/HIGHENTROPYVA -C link-arg=/GUARD:CF --remap-path-prefix=%ROOT%=. --remap-path-prefix=%CARGO_HOME%=./cargo_home"
 
-echo [*] RUSTFLAGS set to:
+echo [rcrypt-build] RUSTFLAGS:
 echo     %RUSTFLAGS%
 echo.
 
-echo [*] Cleaning build artifacts...
+echo [rcrypt-build] Cleaning build artefacts...
 cargo clean
 if errorlevel 1 goto :error
 
 echo.
-echo [*] Running cargo test...
-cargo test
+echo [rcrypt-build] Running cargo test --release ...
+cargo test --release --all-targets
 if errorlevel 1 goto :error
 
 echo.
-echo [*] Building release binary...
+echo [rcrypt-build] Building hardened release binary ...
 cargo build --release
 if errorlevel 1 goto :error
 
 echo.
-echo [*] Build completed.
-
-rem Optionally, uncomment this section to copy the binary next to the script
-rem (assumes the binary name is 'rcrypt.exe'):
-
-rem echo [*] Copying release binary to current directory...
-rem copy /Y "target\release\rcrypt.exe" ".\rcrypt.exe"
-rem if errorlevel 1 goto :error
-rem echo [*] Copied rcrypt.exe to current directory.
-
+echo [rcrypt-build] Build completed. Output: target\release\rcrypt.exe
 goto :eof
 
 :error
 echo.
-echo [!] An error occurred during build or tests.
+echo [rcrypt-build] An error occurred during build or tests.
 exit /b 1
-pause
